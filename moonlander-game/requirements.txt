@@ -1,0 +1,5 @@
+pygmo==2.19.5
+mock==5.2.0
+pygame==2.6.1
+scikit-image==0.25.2
+scikit-learn==1.6.1

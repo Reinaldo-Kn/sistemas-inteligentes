@@ -30,6 +30,10 @@ def linear(x):
 def relu(x):
     return (x > 0)*x
 
+def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+
+
 def softmax(x):
     return special.softmax(x)
 

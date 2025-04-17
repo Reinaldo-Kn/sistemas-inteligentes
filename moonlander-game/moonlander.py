@@ -16,34 +16,30 @@ import bisect
 import pickle
 import time
 import copy
-from neuralnetwork import layerDenseCreate, networkCalculate, networkDeserialize, networkSerialize, relu
+from neuralnetwork import layerDenseCreate, networkCalculate, networkDeserialize, networkSerialize, relu, sigmoid
 
 
 class NeuralController:
     def __init__(self):
         self.layers = [
             layerDenseCreate(8, 4, relu),
-            layerDenseCreate(4, 3, relu)
+            layerDenseCreate(4, 3, sigmoid),
         ]
-        # Força pequenos impulsos iniciais (REMOVA DEPOIS DE TESTAR)
-        self.layers[0]['weights'][:, 0] = 0.1  # Esquerda leve
-        self.layers[0]['weights'][:, 1] = 0.2  # Thrust moderado
-        self.layers[0]['weights'][:, 2] = 0.1  # Direita leve
 
     def get_controls(self, game_state, landscape):
         inputs = np.array([
             game_state.landerx / GameConstants.screenWidth,
             game_state.landery / GameConstants.screenHeight,
-            game_state.landerdx / 50,  # Reduzi a divisão para aumentar sensibilidade
-            game_state.landerdy / 50,
-            game_state.landerRotation / 45,  # Dobrei a sensibilidade
+            game_state.landerdx / 20,  
+            game_state.landerdy / 20,
+            game_state.landerRotation / 180,  
             1.0 if any(line.landingSpot for line in landscape) else 0.0,
             min(game_state.fuel / 500, 1.0),
-            0.0  # Removi o estado de pouso/explosão das entradas
+            0.0  
         ])
         
         output = networkCalculate(inputs.reshape(1, -1), self.layers)[0]
-        return output[0] > 0.7, output[1] > 0.5, output[2] > 0.7  # Ajustei os thresholds
+        return output 
 
 class GameConstants:
     #                  R    G    B
@@ -490,10 +486,8 @@ def handleEvents(game):
     if not hasattr(game, 'neural_controller'):
         game.neural_controller = NeuralController()
     
-    # Obter controles da rede neural
     left, thrust, right = game.neural_controller.get_controls(gs, game.landscape)
     
-    # Aplicar controles
     gs.rotateLanderLeft = left
     gs.increaseLanderThrust = thrust
     gs.rotateLanderRight = right
@@ -502,63 +496,84 @@ def handleEvents(game):
         if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
             pygame.quit()
             sys.exit()
+            
+def avaliar_pouso(game):
+    estado_final = game.states[-1]
+
+    if estado_final.landerLanded:
+        return 1000
+    elif estado_final.landerExploded:
+        vel = abs(estado_final.landerdx) + abs(estado_final.landerdy)
+        return -500 - 10 * vel
+    else:
+        distancia = abs(estado_final.landery)
+        vel = abs(estado_final.landerdx) + abs(estado_final.landerdy)
+        return -distancia - vel
+
 def train_simple_controller():
     controller = NeuralController()
     best_score = -float('inf')
     
-    for i in range(50):  # Reduzi para 50 iterações
-        # Gera pesos com variação controlada
-        weights = np.clip(np.random.normal(0, 0.5, len(networkSerialize(controller.layers))), -1, 1)
+    for i in range(50):  
+        weights = np.random.uniform(-1, 1, len(networkSerialize(controller.layers)))
         networkDeserialize(weights, controller.layers)
         
         score = 0
-        for _ in range(3):  # Testa cada peso 3 vezes
-            score += simulate_game(controller) / 3
+        for _ in range(3):
+            result = simulate_game(controller)
+            print(f"Tentativa: score = {result:.2f}")
+            score += result / 3
+
             
         if score > best_score or i == 0:
+            best_controller = copy.deepcopy(controller)
             best_score = score
             best_weights = weights
             print(f"Melhoria! Score: {score:.2f}")
-            if score > -100:  # Se conseguir algo melhor que explodir imediatamente
-                break  # Interrompe se encontrar um mínimo viável
     
     networkDeserialize(best_weights, controller.layers)
-    return controller
+    simulate_game(best_controller, render=True)  # Mostra o jogo
+    return best_controller
 
-def simulate_game(controller):
-    game = Game(GameConstants.screenWidth, GameConstants.screenHeight, 1/GameConstants.FPS, False)
+
+def simulate_game(controller, render=False):
+    game = Game(GameConstants.screenWidth, GameConstants.screenHeight, 1/GameConstants.FPS, render)
     score = 0
     
-    for _ in range(100):  # Limita a 100 frames por simulação
+    for _ in range(1000):  
         if not game.alive:
             break
-            
+
         gs = game.states[-1]
         left, thrust, right = controller.get_controls(gs, game.landscape)
-        
+
         new_gs = copy.copy(gs)
         new_gs.rotateLanderLeft = left
         new_gs.increaseLanderThrust = thrust
         new_gs.rotateLanderRight = right
         game.states.append(new_gs)
-        
+
         game.update()
         
-        # Recompensa por permanecer vivo
-        score += 1
-        
-        # Recompensa por reduzir velocidade
-        score -= abs(new_gs.landerdx) * 0.1
-        score -= abs(new_gs.landerdy) * 0.1
-        
+        score -= abs(new_gs.landerdx) * 0.5
+        score -= abs(new_gs.landerdy) * 0.5
+        score -= abs(new_gs.landerRotation) * 0.2
+        score -= abs(GameConstants.screenHeight - new_gs.landery) * 0.05
+
         if new_gs.landerLanded:
-            score += 1000
+            score += 3000
             break
         elif new_gs.landerExploded:
-            score -= 500
+            score -=10000
             break
-    
+
+    if render:
+        time.sleep(3)
+    print(f"Final: landed={new_gs.landerLanded}, exploded={new_gs.landerExploded}, score={score:.2f}")
+
     return score
+
+
 def saveGame(game):
     with open("moonlander-{}.pickle".format(time.strftime("%Y%m%d-%H%M%S")), "wb") as f:
         pickle.dump([GameConstants, game], f)
@@ -682,32 +697,29 @@ def mainGameAutonomousUserInputs(gamestates):
     finally:
         # close up shop
         pygame.quit() 
-    
+
 
 if __name__ == "__main__":
     trained_controller = train_simple_controller()
     
-    # Inicializar jogo com o controlador treinado
     screen, font, game, fpsClock = initialize()
     
     while True:
         gs = copy.copy(game.states[-1])
         game.states += [gs]
         
-        # Obter controles do controlador treinado
         left, thrust, right = trained_controller.get_controls(gs, game.landscape)
         gs.rotateLanderLeft = left
         gs.increaseLanderThrust = thrust
         gs.rotateLanderRight = right
         
-        # Atualizar e desenhar
         game.update()
         rects = draw(screen, font, game)
         pygame.display.update(rects)
         
         fpsClock.tick(GameConstants.FPS)
         
-        # Reiniciar se o jogo acabou
+    
         if not game.alive:
             time.sleep(2)
             screen, font, game, fpsClock = initialize()

@@ -19,28 +19,45 @@ import copy
 from neuralnetwork import layerDenseCreate, networkCalculate, networkDeserialize, networkSerialize, relu, sigmoid
 
 
-class NeuralController:
+class ImprovedNeuralController:
     def __init__(self):
         self.layers = [
-            layerDenseCreate(8, 4, relu),
-            layerDenseCreate(4, 3, sigmoid),
+            layerDenseCreate(8, 16, relu),  # Camada maior
+            layerDenseCreate(16, 8, relu),   # Camada intermediária
+            layerDenseCreate(8, 3, sigmoid)  # Camada de saída
         ]
 
     def get_controls(self, game_state, landscape):
+        # Inputs mais informativos:
         inputs = np.array([
             game_state.landerx / GameConstants.screenWidth,
             game_state.landery / GameConstants.screenHeight,
-            game_state.landerdx / 20,  
+            game_state.landerdx / 20,
             game_state.landerdy / 20,
-            game_state.landerRotation / 180,  
-            1.0 if any(line.landingSpot for line in landscape) else 0.0,
-            min(game_state.fuel / 500, 1.0),
-            0.0  
+            game_state.landerRotation / 180,
+            # Distância até o local de pouso mais próximo
+            self._distance_to_landing_spot(game_state, landscape),
+            game_state.fuel / 500,
+            # Altitude normalizada invertida (1 = no chão)
+            1 - (game_state.landery / GameConstants.screenHeight)
         ])
         
         output = networkCalculate(inputs.reshape(1, -1), self.layers)[0]
-        return output 
-
+        return output[0], output[1], output[2]  # left, thrust, right
+    
+    def _distance_to_landing_spot(self, game_state, landscape):
+        landing_spots = [l for l in landscape if l.landingSpot]
+        if not landing_spots:
+            return 0.5  # Valor padrão se não houver locais de pouso
+        
+        min_dist = float('inf')
+        for spot in landing_spots:
+            spot_center = (spot.p0.x + spot.p1.x) / 2
+            dist = abs(game_state.landerx - spot_center) / GameConstants.screenWidth
+            if dist < min_dist:
+                min_dist = dist
+                
+        return min_dist
 class GameConstants:
     #                  R    G    B
     ColorWhite     = (255, 255, 255)
@@ -484,7 +501,7 @@ def handleEvents(game):
     
     
     if not hasattr(game, 'neural_controller'):
-        game.neural_controller = NeuralController()
+        game.neural_controller = ImprovedNeuralController()
     
     left, thrust, right = game.neural_controller.get_controls(gs, game.landscape)
     
@@ -509,38 +526,90 @@ def avaliar_pouso(game):
         distancia = abs(estado_final.landery)
         vel = abs(estado_final.landerdx) + abs(estado_final.landerdy)
         return -distancia - vel
-
-def train_simple_controller():
-    controller = NeuralController()
-    best_score = -float('inf')
     
-    for i in range(50):  
-        weights = np.random.uniform(-1, 1, len(networkSerialize(controller.layers)))
-        networkDeserialize(weights, controller.layers)
+def evaluate_landing(game):
+    final_state = game.states[-1]
+    
+    if final_state.landerLanded:
+        # Recompensa por pouso bem-sucedido
+        rotation_penalty = abs(final_state.landerRotation) * 2
+        speed_penalty = (abs(final_state.landerdx) + abs(final_state.landerdy)) * 5
+        return 1000 - rotation_penalty - speed_penalty
+    elif final_state.landerExploded:
+        # Penalidade por explosão baseada na velocidade
+        return -1000 - (abs(final_state.landerdx) + abs(final_state.landerdy)) * 10
+    else:
+        # Recompensa intermediária baseada em:
+        # - Proximidade ao solo
+        # - Velocidade controlada
+        # - Orientação adequada
+        altitude_reward = (GameConstants.screenHeight - final_state.landery) * 0.1
+        speed_penalty = (abs(final_state.landerdx) + abs(final_state.landerdy)) * 2
+        rotation_penalty = abs(final_state.landerRotation) * 0.5
+        return altitude_reward - speed_penalty - rotation_penalty
+    
+def genetic_algorithm_training(population_size=50, generations=20, mutation_rate=0.1):
+    population = [ImprovedNeuralController() for _ in range(population_size)]
+    
+    for generation in range(generations):
+        # Avaliar cada indivíduo
+        scores = []
+        for individual in population:
+            score = 0
+            for _ in range(3):  # Média de 3 tentativas
+                result = simulate_game(individual)
+                score += result
+            scores.append(score / 3)
         
-        score = 0
-        for _ in range(3):
-            result = simulate_game(controller)
-            print(f"Tentativa: score = {result:.2f}")
-            score += result / 3
-
+        # Selecionar os melhores
+        ranked = sorted(zip(scores, population), key=lambda x: x[0], reverse=True)
+        best = ranked[0]
+        print(f"Geração {generation}: Melhor score = {best[0]:.2f}")
+        
+        # Manter os melhores 25%
+        top_quarter = [x[1] for x in ranked[:population_size//4]]
+        
+        # Reproduzir e mutar
+        new_population = top_quarter.copy()
+        while len(new_population) < population_size:
+            parent = random.choice(top_quarter)
+            child = copy.deepcopy(parent)
             
-        if score > best_score or i == 0:
-            best_controller = copy.deepcopy(controller)
-            best_score = score
-            best_weights = weights
-            print(f"Melhoria! Score: {score:.2f}")
+            # Aplicar mutação
+            weights = networkSerialize(child.layers)
+            for i in range(len(weights)):
+                if random.random() < mutation_rate:
+                    weights[i] += random.uniform(-0.5, 0.5)
+            networkDeserialize(weights, child.layers)
+            
+            new_population.append(child)
+        
+        population = new_population
     
-    networkDeserialize(best_weights, controller.layers)
-    simulate_game(best_controller, render=True)  # Mostra o jogo
+    return population[0]  # Retorna o melhor indivíduo
+def train_controller():
+    # Usar algoritmo genético para treinamento
+    best_controller = genetic_algorithm_training()
+    
+    # Testar o melhor controlador
+    print("\nTestando o melhor controlador:")
+    simulate_game(best_controller, render=True)
+    
     return best_controller
 
 
-def simulate_game(controller, render=False):
-    game = Game(GameConstants.screenWidth, GameConstants.screenHeight, 1/GameConstants.FPS, render)
-    score = 0
+def simulate_game(controller, render=False, max_steps=1000):
+    if render:
+        # Inicializar pygame se estiver renderizando
+        pygame.init()
+        screen = pygame.display.set_mode((GameConstants.screenWidth, GameConstants.screenHeight))
+        font = pygame.font.SysFont('Courier', GameConstants.fontSize)
+        fpsClock = pygame.time.Clock()
     
-    for _ in range(1000):  
+    game = Game(GameConstants.screenWidth, GameConstants.screenHeight, 1/GameConstants.FPS, render)
+    total_reward = 0
+    
+    for step in range(max_steps):
         if not game.alive:
             break
 
@@ -548,30 +617,54 @@ def simulate_game(controller, render=False):
         left, thrust, right = controller.get_controls(gs, game.landscape)
 
         new_gs = copy.copy(gs)
-        new_gs.rotateLanderLeft = left
-        new_gs.increaseLanderThrust = thrust
-        new_gs.rotateLanderRight = right
+        new_gs.rotateLanderLeft = left > 0.5
+        new_gs.increaseLanderThrust = thrust > 0.5
+        new_gs.rotateLanderRight = right > 0.5
         game.states.append(new_gs)
 
         game.update()
         
-        score -= abs(new_gs.landerdx) * 0.5
-        score -= abs(new_gs.landerdy) * 0.5
-        score -= abs(new_gs.landerRotation) * 0.2
-        score -= abs(GameConstants.screenHeight - new_gs.landery) * 0.05
+        # Cálculo da recompensa (mesmo código anterior)
+        reward = 0
+        if new_gs.landerdy < 0:
+            reward += abs(new_gs.landerdy) * 0.1
+        else:
+            reward -= new_gs.landerdy * 0.5
+        reward -= abs(new_gs.landerdx) * 0.3
+        reward -= abs(new_gs.landerRotation) * 0.1
+        reward += (500 - new_gs.fuel) * 0.01
+        total_reward += reward
 
-        if new_gs.landerLanded:
-            score += 3000
-            break
-        elif new_gs.landerExploded:
-            score -=10000
-            break
+        if render:
+            # Desenhar o jogo
+            rects = []
+            rects += [screen.fill(GameConstants.BackgroundColor)]
+            rects += landscapeDraw(screen, game)
+            rects += infoDraw(screen, font, game)
+            rects += lunarLanderDraw(screen, game)
+            pygame.display.update(rects)
+            fpsClock.tick(GameConstants.FPS)
+
+            # Processar eventos para não travar
+            for event in pygame.event.get():
+                if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+                    pygame.quit()
+                    return total_reward
+
+    # Recompensa/penalidade final (mesmo código anterior)
+    final_state = game.states[-1]
+    if final_state.landerLanded:
+        rotation_penalty = abs(final_state.landerRotation) * 2
+        speed_penalty = (abs(final_state.landerdx) + abs(final_state.landerdy)) * 5
+        total_reward += 1000 - rotation_penalty - speed_penalty
+    elif final_state.landerExploded:
+        total_reward -= 1000 + (abs(final_state.landerdx) + abs(final_state.landerdy)) * 10
 
     if render:
-        time.sleep(3)
-    print(f"Final: landed={new_gs.landerLanded}, exploded={new_gs.landerExploded}, score={score:.2f}")
-
-    return score
+        time.sleep(2)
+        pygame.quit()
+        
+    return total_reward
 
 
 def saveGame(game):
@@ -700,26 +793,31 @@ def mainGameAutonomousUserInputs(gamestates):
 
 
 if __name__ == "__main__":
-    trained_controller = train_simple_controller()
+    # Treinar ou carregar um controlador treinado
+    try:
+        trained_controller = train_controller()
+    except KeyboardInterrupt:
+        print("Treinamento interrompido pelo usuário")
+        sys.exit()
     
+    # Configuração do pygame para visualização
     screen, font, game, fpsClock = initialize()
     
+    # Loop de demonstração
     while True:
         gs = copy.copy(game.states[-1])
         game.states += [gs]
         
         left, thrust, right = trained_controller.get_controls(gs, game.landscape)
-        gs.rotateLanderLeft = left
-        gs.increaseLanderThrust = thrust
-        gs.rotateLanderRight = right
+        gs.rotateLanderLeft = left > 0.5
+        gs.increaseLanderThrust = thrust > 0.5
+        gs.rotateLanderRight = right > 0.5
         
         game.update()
         rects = draw(screen, font, game)
         pygame.display.update(rects)
-        
         fpsClock.tick(GameConstants.FPS)
         
-    
         if not game.alive:
             time.sleep(2)
             screen, font, game, fpsClock = initialize()
